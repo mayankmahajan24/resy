@@ -1,0 +1,8 @@
+# Impeccable tool cache (local artifact, not source)
+.impeccable/
+
+# Conductor workspace scratch
+.context/
+
+# Playwright install for the OpenTable checker (installed on demand via setup_opentable.sh)
+node_modules/
