@@ -91,21 +91,53 @@ confirm; not a guaranteed table). `NOT FOUND` means no slug variant resolved —
 try the real slug from the venue's own "reserve"/SevenRooms link (see "Coverage"). Report the
 instant-vs-request distinction to the user.
 
-### 3. OpenTable — `scripts/opentable.js` (needs cookies + headed Chrome, hardest)
+### 3. OpenTable — behind Akamai; **prefer the CDP ride-along** (`scripts/opentable_cdp.js`)
 
-OpenTable is behind Akamai, which **resets the connection for every non-browser client** (curl,
-headless Chrome, server-side fetchers). The only reliable path is a **real visible Chrome window**
-with the user's opentable.com cookies. **A Chrome window will flash open when this runs — expected,
-not an error.**
+OpenTable is behind Akamai Bot Manager, which **resets the connection for every non-browser client**
+(curl, headless Chrome, server-side fetchers) and, crucially, ties the `_abck` anti-bot token to the
+**specific browser fingerprint** it was minted in. This is why the old cookie-injection path
+(`scripts/opentable.js`) is unreliable: injecting a copied `Cookie:` header into a *fresh Playwright
+Chrome* gives Akamai "valid cookie, wrong/robotic browser" (Playwright leaks `navigator.webdriver` /
+CDP signals), so it serves a challenge — you get a first pageview that works, then **403 "Access
+Denied"** or **"no availability request captured"** on everything after. Grabbing fresher cookies does
+NOT fix this — the browser is the tell, not the cookie.
 
-One-time setup (installs Playwright into `~/.cache/reservation-checker`, uses system Chrome):
+One-time setup (installs Playwright into `~/.cache/reservation-checker`, uses system Chrome), shared
+by both methods:
 ```bash
 bash scripts/setup_opentable.sh
 ```
 
-Get cookies: user copies the raw `Cookie:` header from any logged-in opentable.com request in
-devtools into a file. Cookies contain session-bound anti-bot tokens (`_abck`, `bm_*`) that
-**expire** — re-paste when calls start failing.
+#### 3a. Preferred: CDP ride-along — `scripts/opentable_cdp.js`
+
+Don't copy cookies at all. **Attach to the user's REAL Chrome**, which already passed Akamai. Same
+fingerprint, TLS, and validated session → indistinguishable from the user browsing.
+
+1. Launch a dedicated Chrome with a debugging port + **separate** profile (a separate `--user-data-dir`
+   is required — Chrome refuses remote debugging on a profile already open in another running Chrome),
+   then have the user log in to opentable.com once in that window:
+   ```bash
+   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+     --remote-debugging-port=9222 --user-data-dir=/tmp/ot-chrome-profile https://www.opentable.com/
+   ```
+2. Once they're logged in, run the checker (it attaches via `connectOverCDP`, reuses the open tab, and
+   **scrapes the visible time-slot buttons** rather than replaying the GraphQL API — so there's no
+   fragile request to capture):
+   ```bash
+   OT_DAY=2026-07-20 OT_PARTY=4 OT_START=18:00 OT_END=20:00 OT_TZ=America/New_York \
+     node scripts/opentable_cdp.js '[{"name":"Zou Zous","slug":"zou-zous-new-york"}]'
+   ```
+   Override the endpoint with `OT_CDP=http://localhost:9222` if needed. Closing the script only
+   disconnects CDP — it does **not** kill the user's Chrome. Output JSON per restaurant: `window`
+   (slots inside the requested window) and `allFound` (all slots that day); an Akamai challenge is
+   reported as `error: "akamai challenge (session not trusted)"`.
+
+#### 3b. Fallback (legacy): cookie injection — `scripts/opentable.js`
+
+Use only if the CDP path isn't possible (e.g. can't launch Chrome with a debug port). User copies the
+raw `Cookie:` header from any logged-in opentable.com request in devtools into a file (session-bound
+`_abck`/`bm_*` tokens **expire** — re-paste when calls fail; expect it to work for one or two venues
+then start blocking):
 
 ```bash
 OT_COOKIE_FILE=/path/to/ot_cookies.txt OT_DAY=2026-07-20 OT_PARTY=4 \
@@ -113,10 +145,9 @@ OT_COOKIE_FILE=/path/to/ot_cookies.txt OT_DAY=2026-07-20 OT_PARTY=4 \
   node scripts/opentable.js '[{"name":"Zaytinya","slug":"zaytinya-new-york"}]'
 ```
 
-Each target needs an OpenTable **slug** (path segment in `opentable.com/r/<slug>`); the numeric
-`restaurantId` is auto-discovered from the page (or pass `"rid": <number>`). The script queries
-6/7/8 PM anchors and unions results to cover the window. Output JSON per restaurant: `window`
-(slots inside the requested window) and `allFound` (all slots that day).
+Both scripts take an OpenTable **slug** (path segment in `opentable.com/r/<slug>`) per target and query
+6/7/8 PM anchors, unioning results to cover the window. `opentable.js` also auto-discovers the numeric
+`restaurantId` (or pass `"rid": <number>`).
 
 ## Workflow
 
@@ -124,8 +155,20 @@ Each target needs an OpenTable **slug** (path segment in `opentable.com/r/<slug>
 2. Confirm/assume constraints (date, party, window). Convert to script flags.
 3. Run **Resy** for the whole list in one call (get token from user if not already have a fresh one).
 4. For `UNMATCHED` restaurants, try **SevenRooms** (= DoorDash Reservations; pass names, it
-   auto-guesses slugs) and **OpenTable** (needs cookies + `setup_opentable.sh`). Verify name
-   matches by address/neighborhood to avoid false positives (e.g. a similarly-named different venue).
+   auto-guesses slugs) and **OpenTable** (prefer the CDP ride-along, §3a). Verify name matches by
+   address/neighborhood to avoid false positives (e.g. a similarly-named different venue).
+
+   **OpenTable-only shortcut.** If, after Resy + SevenRooms, the *only* remaining unchecked
+   restaurants are ones that resolve on OpenTable (or the user explicitly asked for restaurants
+   you know to be OpenTable-only), don't stop to ask how to proceed. Instead:
+   - **First report everything you already have** (Resy + SevenRooms results) as a normal table,
+     so the user isn't blocked waiting on OpenTable.
+   - Then, in the same message, **set up the CDP ride-along** (§3a) for the remaining venue(s) —
+     name them. Launch the debug-port Chrome yourself and ask the user only to *log in to
+     opentable.com* in that window and say "go" (runs `setup_opentable.sh` once if not yet set up).
+     As soon as they confirm, run `scripts/opentable_cdp.js` and fold the results into the table.
+     Only fall back to asking for a pasted `Cookie:` header + `scripts/opentable.js` (§3b) if the
+     CDP path isn't workable.
 5. **Coverage check (do this every run).** Collect any restaurant that matched on *none* of the
    three backends and report it in a distinct **"⚠️ not found on any platform"** section — separate
    from "on a platform but no slots in your window." Coverage of reservation-taking restaurants
@@ -146,6 +189,10 @@ Each target needs an OpenTable **slug** (path segment in `opentable.com/r/<slug>
   `baohausnyc`). Never build/look for a separate DoorDash availability endpoint.
 - Resy web page scraping is a **dead end** in automated browsers here (anonymous `/4/find` 500s) —
   always use the API with a token.
+- **OpenTable: prefer CDP ride-along (§3a) over cookie injection (§3b).** Akamai binds `_abck` to the
+  browser fingerprint, so a fresh Playwright Chrome with copied cookies gets challenged (403 /
+  "no request captured") after ~1 venue. Attaching to the user's real, already-trusted Chrome and
+  scraping the rendered slots is the robust path — verified to clear the block cleanly.
 - All three checkers run restaurants in parallel; a full list resolves in ~seconds (Resy/SevenRooms).
 - Tokens/cookies are **per-user, expiring bearer credentials**. If the user pastes one into chat,
   note that logging out/in on that site rotates it.
